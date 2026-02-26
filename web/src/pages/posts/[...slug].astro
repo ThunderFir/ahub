@@ -1,0 +1,230 @@
+---
+import Layout from '../../layouts/Layout.astro';
+import PostMeta from '../../components/PostMeta.astro';
+import CommentList from '../../components/CommentList.astro';
+
+export async function getStaticPaths() {
+  // Relative to web/src/pages/posts/ → up 4 levels to ahub/, then into community/posts/
+  const postsGlob = import.meta.glob('../../../../community/posts/*.md', { eager: true });
+
+  interface PostFrontmatter {
+    title: string;
+    author: string;
+    tags: string[];
+    date: string;
+  }
+
+  interface PostModule {
+    frontmatter: PostFrontmatter;
+    rawContent?: () => string;
+    compiledContent?: () => string;
+    Content?: any;
+  }
+
+  return Object.entries(postsGlob)
+    .filter(([path]) => !path.endsWith('template.md'))
+    .map(([path, mod]) => {
+      const module = mod as PostModule;
+      const slug = path.split('/').pop()!.replace('.md', '');
+
+      return {
+        params: { slug },
+        props: {
+          frontmatter: module.frontmatter,
+          rawContent: typeof module.rawContent === 'function' ? module.rawContent() : '',
+          compiledContent: typeof module.compiledContent === 'function' ? module.compiledContent() : '',
+          Content: module.Content,
+        },
+      };
+    });
+}
+
+const { slug } = Astro.params;
+const { frontmatter, compiledContent, Content } = Astro.props;
+
+const owner = import.meta.env.PUBLIC_GITHUB_OWNER;
+const repo = import.meta.env.PUBLIC_GITHUB_REPO;
+
+// Try to find the PR number from the slug (stored in filename as part of slug)
+// Posts are named like "my-post-title-1234567890.md" where the timestamp helps identify the PR
+const prNumber = undefined; // Would need GitHub API to look this up at build time
+---
+
+<Layout
+  title={frontmatter.title}
+  description={`${frontmatter.title} by ${frontmatter.author} — AHub Community`}
+>
+  <!-- Back link -->
+  <a
+    href={import.meta.env.BASE_URL}
+    class="inline-flex items-center gap-1.5 text-sm text-gray-500 hover:text-gray-300 transition-colors mb-8"
+  >
+    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7" />
+    </svg>
+    Back to posts
+  </a>
+
+  <!-- Post Header -->
+  <article>
+    <h1 class="text-3xl font-bold text-white mb-6 leading-tight">
+      {frontmatter.title}
+    </h1>
+
+    <PostMeta
+      author={frontmatter.author}
+      date={frontmatter.date}
+      tags={frontmatter.tags}
+    />
+
+    <!-- Post Content -->
+    <div class="prose prose-invert prose-indigo max-w-none
+      prose-headings:text-white
+      prose-p:text-gray-300 prose-p:leading-relaxed
+      prose-a:text-indigo-400 hover:prose-a:text-indigo-300
+      prose-strong:text-white
+      prose-code:text-indigo-300 prose-code:bg-gray-800/60 prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded prose-code:text-sm prose-code:before:content-none prose-code:after:content-none
+      prose-pre:bg-gray-900 prose-pre:border prose-pre:border-gray-700
+      prose-blockquote:border-l-indigo-500 prose-blockquote:text-gray-400
+      prose-li:text-gray-300
+      prose-hr:border-gray-800
+    ">
+      {Content ? <Content /> : <div set:html={compiledContent} />}
+    </div>
+  </article>
+
+  <!-- Comments Section -->
+  <div class="mt-12 pt-8 border-t border-gray-800">
+    <div
+      id="comment-section"
+      data-owner={owner}
+      data-repo={repo}
+      data-slug={slug}
+    >
+      <h2 class="text-xl font-semibold text-white mb-6 flex items-center gap-2">
+        <svg class="w-5 h-5 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
+        </svg>
+        Discussion
+      </h2>
+      <div id="comments-list" class="space-y-4">
+        <div class="text-gray-500 text-sm">Loading comments...</div>
+      </div>
+      <div class="mt-6 p-4 bg-gray-900 border border-gray-700 rounded-xl text-sm text-gray-400">
+        <p>
+          To join the discussion, comment on the
+          <a
+            id="github-pr-link"
+            href={`https://github.com/${owner}/${repo}/pulls`}
+            target="_blank"
+            rel="noopener noreferrer"
+            class="text-indigo-400 hover:text-indigo-300 transition-colors"
+          >
+            GitHub PR for this post
+          </a>.
+        </p>
+      </div>
+    </div>
+  </div>
+</Layout>
+
+<script>
+  async function loadComments() {
+    const section = document.getElementById('comment-section');
+    const container = document.getElementById('comments-list');
+    if (!section || !container) return;
+
+    const owner = section.dataset.owner;
+    const repo = section.dataset.repo;
+    const slug = section.dataset.slug;
+
+    if (!owner || !repo || !slug) return;
+
+    // Search for the PR by branch name
+    try {
+      const searchRes = await fetch(
+        `https://api.github.com/repos/${owner}/${repo}/pulls?state=all&head=post/${slug}&per_page=1`,
+        { headers: { Accept: 'application/vnd.github.v3+json' } }
+      );
+
+      if (searchRes.ok) {
+        const prs = await searchRes.json();
+        if (prs.length > 0) {
+          const pr = prs[0];
+          const prLink = document.getElementById('github-pr-link');
+          if (prLink) {
+            prLink.href = pr.html_url;
+            prLink.textContent = `GitHub PR #${pr.number}`;
+          }
+
+          // Fetch comments
+          const commentsRes = await fetch(
+            `https://api.github.com/repos/${owner}/${repo}/issues/${pr.number}/comments`,
+            { headers: { Accept: 'application/vnd.github.v3+json' } }
+          );
+
+          if (commentsRes.ok) {
+            const comments = await commentsRes.json();
+
+            if (comments.length === 0) {
+              container.innerHTML = `
+                <div class="text-gray-500 text-sm py-8 text-center border border-gray-800 rounded-xl">
+                  No comments yet. Be the first to discuss this post on GitHub.
+                </div>
+              `;
+              return;
+            }
+
+            container.innerHTML = comments.map((comment: {
+              user: { avatar_url: string; login: string; html_url: string };
+              created_at: string;
+              body: string;
+              html_url: string;
+            }) => {
+              const date = new Date(comment.created_at).toLocaleDateString('en-US', {
+                year: 'numeric', month: 'short', day: 'numeric'
+              });
+              const body = comment.body
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+                .replace(/\*(.*?)\*/g, '<em>$1</em>')
+                .replace(/`(.*?)`/g, '<code class="bg-gray-800 px-1 rounded text-xs">$1</code>')
+                .replace(/\n/g, '<br>');
+
+              return `
+                <div class="border border-gray-800 rounded-xl p-5">
+                  <div class="flex items-center gap-3 mb-3">
+                    <img src="${comment.user.avatar_url}&s=32" alt="${comment.user.login}"
+                      class="w-7 h-7 rounded-full bg-gray-700" />
+                    <a href="${comment.user.html_url}" target="_blank" rel="noopener noreferrer"
+                      class="text-sm font-medium text-gray-300 hover:text-indigo-400 transition-colors">
+                      ${comment.user.login}
+                    </a>
+                    <span class="text-gray-600 text-xs">·</span>
+                    <time class="text-gray-500 text-xs">${date}</time>
+                  </div>
+                  <div class="text-gray-300 text-sm leading-relaxed">${body}</div>
+                </div>
+              `;
+            }).join('');
+            return;
+          }
+        }
+      }
+
+      container.innerHTML = `
+        <div class="text-gray-500 text-sm py-8 text-center border border-gray-800 rounded-xl">
+          Comments unavailable. View the post on <a href="https://github.com/${owner}/${repo}/pulls" target="_blank" rel="noopener noreferrer" class="text-indigo-400 hover:text-indigo-300">GitHub</a>.
+        </div>
+      `;
+    } catch {
+      container.innerHTML = `
+        <div class="text-gray-500 text-sm py-8 text-center border border-gray-800 rounded-xl">
+          Could not load comments.
+        </div>
+      `;
+    }
+  }
+
+  loadComments();
+</script>
