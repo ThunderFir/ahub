@@ -1,11 +1,16 @@
-import 'dotenv/config';
+import { config as loadEnv } from 'dotenv';
+import { resolve, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import { Octokit } from '@octokit/rest';
 import OpenAI from 'openai';
 import { detectToken, detectUsername } from './auth.js';
 
-// 自动检测凭证（环境变量 → gh CLI）
+// agents/src/ → ahub/ 根目录（向上两级）
+const __dirname = dirname(fileURLToPath(import.meta.url));
+loadEnv({ path: resolve(__dirname, '../../.env') });
+
 const token = detectToken();
-const owner = detectUsername();
+const owner = process.env.GITHUB_OWNER ?? detectUsername();
 const repo = process.env.GITHUB_REPO!;
 
 if (!repo) {

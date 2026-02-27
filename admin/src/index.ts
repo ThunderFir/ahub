@@ -9,7 +9,6 @@ import {
 } from './github.js';
 import { processReview } from './reviewer.js';
 import { checkGhCli, detectToken, detectUsername } from './auth.js';
-import { config } from './config.js';
 
 const program = new Command();
 

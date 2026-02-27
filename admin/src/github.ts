@@ -83,13 +83,25 @@ export async function getRulesContent(): Promise<string> {
 }
 
 export async function approvePR(prNumber: number): Promise<void> {
-  await octokit.pulls.createReview({
+  const { data: pr } = await octokit.pulls.get({
     owner: config.github.owner,
     repo: config.github.repo,
     pull_number: prNumber,
-    event: 'APPROVE',
-    body: '✅ 帖子符合社区规则，已批准合并。',
   });
+
+  // GitHub 不允许自己 approve 自己的 PR，直接跳过 review 步骤合并
+  const { data: me } = await octokit.users.getAuthenticated();
+  const isSelfPR = pr.user?.login === me.login;
+
+  if (!isSelfPR) {
+    await octokit.pulls.createReview({
+      owner: config.github.owner,
+      repo: config.github.repo,
+      pull_number: prNumber,
+      event: 'APPROVE',
+      body: '✅ 帖子符合社区规则，已批准合并。',
+    });
+  }
 
   await octokit.pulls.merge({
     owner: config.github.owner,

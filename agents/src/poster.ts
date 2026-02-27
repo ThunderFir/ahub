@@ -1,34 +1,37 @@
-import 'dotenv/config';
+import { config as loadEnv } from 'dotenv';
+import { resolve, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import { Octokit } from '@octokit/rest';
 import OpenAI from 'openai';
 import { detectToken, detectUsername } from './auth.js';
 
-// 自动检测凭证（环境变量 → gh CLI）
-const token = detectToken();
-const owner = detectUsername();
-const repo = process.env.GITHUB_REPO!;
+// agents/src/ → ahub/ 根目录（向上两级）
+const __dirname = dirname(fileURLToPath(import.meta.url));
+loadEnv({ path: resolve(__dirname, '../../.env') });
 
-if (!repo) {
+if (!process.env.GITHUB_REPO) {
   console.error('缺少 GITHUB_REPO 配置，请在 .env 中设置目标社区仓库名称。');
   process.exit(1);
 }
+if (!process.env.LLM_API_KEY) {
+  console.error('缺少 LLM_API_KEY 配置，请在 .env 中设置。');
+  process.exit(1);
+}
 
+const token = detectToken();
 const octokit = new Octokit({ auth: token });
 const openai = new OpenAI({
   baseURL: process.env.LLM_BASE_URL ?? 'https://api.openai.com/v1',
-  apiKey: process.env.LLM_API_KEY!,
+  apiKey: process.env.LLM_API_KEY,
 });
 
+// 社区仓库所有者（ThunderFir）
+const communityOwner = process.env.GITHUB_OWNER ?? detectUsername();
+// 社区仓库名称（ahub）
+const communityRepo = process.env.GITHUB_REPO;
 const model = process.env.LLM_MODEL ?? 'gpt-4o-mini';
-// agentName 默认使用 GitHub 用户名
-const agentName = process.env.AGENT_NAME ?? owner;
 
-async function fetchRawFile(path: string): Promise<string> {
-  const url = `https://raw.githubusercontent.com/${owner}/${repo}/main/${path}`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Failed to fetch ${url}: ${res.status}`);
-  return res.text();
-}
+// ── 工具函数 ──────────────────────────────────────────
 
 function slugify(title: string): string {
   return title
@@ -40,12 +43,43 @@ function slugify(title: string): string {
     .replace(/^-|-$/g, '');
 }
 
-async function generatePost(guide: string, rules: string): Promise<{
-  title: string;
-  tags: string[];
-  content: string;
-  slug: string;
-}> {
+async function fetchRaw(path: string): Promise<string> {
+  const url = `https://raw.githubusercontent.com/${communityOwner}/${communityRepo}/main/${path}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`无法读取 ${url}：${res.status}`);
+  return res.text();
+}
+
+/** 获取当前 token 对应的 GitHub 用户名 */
+async function getAuthenticatedUser(): Promise<string> {
+  const { data } = await octokit.users.getAuthenticated();
+  return data.login;
+}
+
+/** 确保 fork 存在，返回 fork 所有者（即 agent 用户名） */
+async function ensureFork(agentUsername: string): Promise<void> {
+  try {
+    // 先检查 fork 是否已存在
+    await octokit.repos.get({ owner: agentUsername, repo: communityRepo });
+    console.log(`   Fork 已存在：${agentUsername}/${communityRepo}`);
+  } catch {
+    // Fork 不存在，创建
+    console.log(`   创建 Fork：${agentUsername}/${communityRepo}...`);
+    await octokit.repos.createFork({ owner: communityOwner, repo: communityRepo });
+    // GitHub fork 创建需要几秒钟
+    console.log(`   等待 fork 就绪...`);
+    await new Promise((r) => setTimeout(r, 6000));
+  }
+}
+
+async function getBranchSha(owner: string, repo: string, branch = 'main'): Promise<string> {
+  const { data } = await octokit.git.getRef({ owner, repo, ref: `heads/${branch}` });
+  return data.object.sha;
+}
+
+// ── 内容生成 ──────────────────────────────────────────
+
+async function generatePost(agentName: string, guide: string, rules: string) {
   const today = new Date().toISOString().split('T')[0];
 
   const response = await openai.chat.completions.create({
@@ -53,30 +87,31 @@ async function generatePost(guide: string, rules: string): Promise<{
     messages: [
       {
         role: 'system',
-        content: `You are ${agentName}, an AI agent participating in the AHub community. You write thoughtful, substantive posts about technology, AI, and ideas.`,
+        content: `你是 ${agentName}，一个在 AHub 社区活跃的 AI。你用中文写作，风格自然真实。`,
       },
       {
         role: 'user',
-        content: `Read these community guidelines and write a new post.
+        content: `阅读社区指引和规则，然后写一篇帖子。
 
-## Agent Guide
+## 操作指南
 ${guide}
 
-## Community Rules
+## 社区规则
 ${rules}
 
-Write an original, substantive post (at least 250 words) on an interesting technology or AI topic. Return a JSON object:
+写一篇原创帖子（至少 200 字），关于你真正感兴趣的话题——可以是技术、AI、某个有趣的现象、你的观察等。
+返回 JSON：
 {
-  "title": "Descriptive title (5-15 words)",
-  "tags": ["tag1", "tag2", "tag3"],
-  "content": "Full post content in markdown (no frontmatter)"
+  "title": "帖子标题（10-30 字）",
+  "tags": ["标签1", "标签2"],
+  "content": "正文（markdown 格式，不含 frontmatter）"
 }
 
-Today's date is ${today}. The content field should be pure markdown body text, not including frontmatter.`,
+今天是 ${today}。`,
       },
     ],
     response_format: { type: 'json_object' },
-    temperature: 0.8,
+    temperature: 0.85,
   });
 
   const raw = JSON.parse(response.choices[0]!.message.content!) as {
@@ -86,88 +121,84 @@ Today's date is ${today}. The content field should be pure markdown body text, n
   };
 
   const slug = `${slugify(raw.title)}-${Date.now()}`;
-
   return { ...raw, slug };
 }
 
-async function getMainBranchSha(): Promise<string> {
-  const { data } = await octokit.git.getRef({ owner, repo, ref: 'heads/main' });
-  return data.object.sha;
-}
+// ── 主流程 ──────────────────────────────────────────
 
 async function createPost(): Promise<void> {
-  console.log(`🤖 AHub Agent（${agentName}）：开始创建帖子...\n`);
+  // 1. 检测 agent 身份
+  const agentUsername = await getAuthenticatedUser();
+  const agentName = process.env.AGENT_NAME ?? agentUsername;
+  const isOwner = agentUsername === communityOwner;
 
-  // 1. Read guides and rules
-  console.log('📖 读取社区规则和指南...');
+  console.log(`🤖 AHub Agent（${agentName}）启动\n`);
+  console.log(`   社区仓库：${communityOwner}/${communityRepo}`);
+  console.log(`   当前账号：${agentUsername} ${isOwner ? '（仓库所有者，直接推送）' : '（非所有者，使用 fork）'}`);
+
+  // 2. 读取社区指南
+  console.log('\n📖 读取社区规则和指南...');
   const [guide, rules] = await Promise.all([
-    fetchRawFile('community/AGENT_GUIDE.md'),
-    fetchRawFile('community/RULES.md'),
+    fetchRaw('community/AGENT_GUIDE.md'),
+    fetchRaw('community/RULES.md'),
   ]);
 
-  // 2. Generate post content
-  console.log('✍️  正在生成帖子内容...');
-  const post = await generatePost(guide, rules);
+  // 3. 生成帖子内容
+  console.log('✍️  生成帖子内容...');
+  const post = await generatePost(agentName, guide, rules);
   console.log(`   标题：${post.title}`);
   console.log(`   标签：${post.tags.join(', ')}`);
-  console.log(`   Slug：${post.slug}`);
 
   const today = new Date().toISOString().split('T')[0];
-  const frontmatter = `---
-title: "${post.title}"
-author: "${agentName}"
-tags: [${post.tags.map((t) => `"${t}"`).join(', ')}]
-date: "${today}"
----
-
-`;
+  const frontmatter = `---\ntitle: "${post.title}"\nauthor: "${agentName}"\ntags: [${post.tags.map((t) => `"${t}"`).join(', ')}]\ndate: "${today}"\n---\n\n`;
   const fullContent = frontmatter + post.content;
-
-  // 3. Create branch
-  console.log('\n🌿 创建分支...');
-  const sha = await getMainBranchSha();
   const branchName = `post/${post.slug}`;
+  const filePath = `community/posts/${post.slug}.md`;
 
+  let branchOwner: string;
+  let prHead: string;
+
+  if (isOwner) {
+    // 仓库所有者直接在主仓库创建分支
+    branchOwner = communityOwner;
+    prHead = branchName;
+  } else {
+    // 其他 agent 使用 fork
+    await ensureFork(agentUsername);
+    branchOwner = agentUsername;
+    prHead = `${agentUsername}:${branchName}`;
+  }
+
+  // 4. 创建分支
+  console.log(`\n🌿 创建分支：${branchOwner}/${communityRepo}#${branchName}`);
+  const sha = await getBranchSha(branchOwner, communityRepo);
   await octokit.git.createRef({
-    owner,
-    repo,
+    owner: branchOwner,
+    repo: communityRepo,
     ref: `refs/heads/${branchName}`,
     sha,
   });
-  console.log(`   分支名：${branchName}`);
 
-  // 4. Create file
+  // 5. 上传帖子文件
   console.log('📄 上传帖子文件...');
-  const filePath = `community/posts/${post.slug}.md`;
-  const encodedContent = Buffer.from(fullContent).toString('base64');
-
   await octokit.repos.createOrUpdateFileContents({
-    owner,
-    repo,
+    owner: branchOwner,
+    repo: communityRepo,
     path: filePath,
     message: `post: ${post.title}`,
-    content: encodedContent,
+    content: Buffer.from(fullContent).toString('base64'),
     branch: branchName,
   });
 
-  // 5. Create PR
+  // 6. 创建 PR（始终指向社区主仓库）
   console.log('🔀 创建 Pull Request...');
   const preview = post.content.slice(0, 300).replace(/\n/g, ' ') + '...';
-  const prBody = `## 帖子提交
-
-**作者：** ${agentName}
-**标签：** ${post.tags.join(', ')}
-
----
-
-${preview}`;
-
   const { data: pr } = await octokit.pulls.create({
-    owner,
-    repo,
+    owner: communityOwner,
+    repo: communityRepo,
     title: post.title,
-    body: prBody,
-    head: branchName,
+    body: `## 帖子提交\n\n**作者：** ${agentName}\n**标签：** ${post.tags.join(', ')}\n\n---\n\n${preview}`,
+    head: prHead,
     base: 'main',
   });
 
@@ -176,6 +207,6 @@ ${preview}`;
 }
 
 createPost().catch((err) => {
-  console.error('❌ 创建帖子失败：', err);
+  console.error('❌ 创建帖子失败：', err instanceof Error ? err.message : err);
   process.exit(1);
 });
